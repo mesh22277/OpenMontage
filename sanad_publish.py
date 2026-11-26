@@ -2,6 +2,9 @@
 """SANAD Publish: staging approved video files for publishing connectors."""
 import os, re, json, time, uuid, hmac, hashlib, secrets, shutil, subprocess
 from pathlib import Path
+from email.parser import BytesParser
+from email.policy import default
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 PORT = int(os.environ.get("SANAD_PUBLISH_PORT", "8765"))
@@ -16,7 +19,7 @@ BASE = os.environ.get("SANAD_PUBLISH_BASE_URL") or (f"https://{NAME}-{PORT}.{DOM
 BASE = BASE.rstrip("/")
 LIMIT = 100 * 1024 * 1024
 TTL = 6 * 3600
-PAGE = """<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SANAD PUBLISH</title><style>body{background:#101010;color:#eee;font:16px system-ui;margin:32px auto;max-width:680px;padding:0 20px}h1{color:#dec18a}section{border:1px solid #383838;padding:20px;border-radius:14px}input,button,textarea{box-sizing:border-box;width:100%;padding:12px;margin:8px 0;background:#202020;color:#eee;border:1px solid #666;border-radius:8px}button{background:#dec18a;color:#111;font-weight:bold}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#aaa}</style><h1>SANAD PUBLISH</h1><p>رفع النسخة المعتمدة وإصدار رابط مؤقت للنشر</p><section><label>رمز الدخول (من طرفية الاستديو)</label><input type="password" id="token" autocomplete="off"><label>الفيديو النهائي MP4</label><input id="file" type="file" accept="video/mp4"><label><input type="checkbox" id="approved" style="width:auto"> هذه النسخة معتمدة للنشر</label><button id="upload">رفع وفحص الفيديو</button><pre id="result" aria-live="polite"></pre><input id="link" readonly dir="ltr" placeholder="رابط الفيديو المؤقت"><button id="copy" disabled>نسخ رابط النشر</button><small>الرابط صالح ست ساعات. لا يتم النشر تلقائيًا من هذه الصفحة.</small></section><script>const $=id=>document.getElementById(id);$('upload').onclick=async()=>{const f=$('file').files[0];if(!f||!$('approved').checked||!$('token').value){$('result').textContent='اختر الفيديو وأكد اعتماده وأدخل رمز الدخول';return;}$('upload').disabled=true;$('result').textContent='جارٍ الرفع والفحص';try{const r=await fetch('/api/upload',{method:'POST',headers:{'Authorization':'Bearer '+$('token').value,'Content-Type':'video/mp4'},body:f});const j=await r.json();if(!r.ok)throw Error(j.error||r.status);$('link').value=j.url;$('copy').disabled=false;$('result').textContent=JSON.stringify(j.metadata,null,2);}catch(e){$('result').textContent=e.message;}finally{$('upload').disabled=false;}};$('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('link').value)}catch(e){$('link').select()}};</script></html>"""
+PAGE = """<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SANAD PUBLISH 1.1</title><style>body{background:#101010;color:#eee;font:16px system-ui;margin:32px auto;max-width:680px;padding:0 20px}h1{color:#dec18a}form,section{border:1px solid #383838;padding:20px;border-radius:14px}input,button{box-sizing:border-box;width:100%;padding:12px;margin:8px 0;background:#202020;color:#eee;border:1px solid #666;border-radius:8px}button{background:#dec18a;color:#111;font-weight:bold}pre,a{white-space:pre-wrap;overflow-wrap:anywhere;color:#eee}small{color:#aaa}</style><h1>SANAD PUBLISH 1.1</h1><p>رفع النسخة المعتمدة وإصدار رابط مؤقت للنشر</p><form action="/api/upload" method="post" enctype="multipart/form-data"><label>رمز الدخول</label><input type="password" name="token" required autocomplete="off"><label>الفيديو النهائي MP4</label><input name="video" type="file" accept="video/mp4,.mp4" required><label><input type="checkbox" name="approved" value="yes" required style="width:auto"> هذه النسخة معتمدة للنشر</label><button type="submit">رفع وفحص الفيديو</button><small>طريقة رفع مباشرة متوافقة مع نماذج Safari. الرابط صالح ست ساعات.</small></form></html>"""
 def sign(asset, expires):
     return hmac.new(TOKEN.encode(), f"{asset}:{expires}".encode(), hashlib.sha256).hexdigest()
 def valid(asset, expires, sig):
@@ -31,7 +34,7 @@ def probe(path):
     if not 3 <= duration <= 900: raise ValueError("Duration must be 3–900 seconds")
     return {"width":v["width"],"height":v["height"],"duration":duration,"codec":v["codec_name"],"bytes":path.stat().st_size,"audio":any(s["codec_type"]=="audio" for s in data["streams"])}
 class Handler(BaseHTTPRequestHandler):
-    protocol_version="HTTP/1.1"
+    protocol_version="HTTP/1.0"
     def log_message(self,*args): pass
     def setup(self):
         super().setup()
@@ -43,26 +46,37 @@ class Handler(BaseHTTPRequestHandler):
     def error_json(self,status,message):
         self.close_connection=True
         self.reply(status,{"error":message})
+    def upload_result(self,status,message,url=None,meta=None):
+        body='<html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#101010;color:white;font:18px system-ui;padding:24px"><h1>SANAD PUBLISH 1.1</h1><p>'+escape(message)+'</p>'
+        if url:
+            safe=escape(url,quote=True)
+            body+='<pre dir="ltr" style="overflow-wrap:anywhere;white-space:pre-wrap">'+escape(url)+'</pre><input id="link" readonly dir="ltr" style="width:100%;padding:12px;box-sizing:border-box" value="'+safe+'"><button style="padding:12px" onclick="navigator.clipboard.writeText(document.getElementById(\'link\').value).catch(()=>document.getElementById(\'link\').select())">نسخ رابط النشر</button><p><a style="color:gold" href="'+safe+'">فتح الفيديو للاختبار</a></p><pre>'+escape(json.dumps(meta,ensure_ascii=False))+'</pre>'
+        body+='<p><a style="color:gold" href="/">رجوع</a></p></body></html>'
+        self.reply(status,body.encode(),"text/html; charset=utf-8")
     def do_POST(self):
         if self.path!="/api/upload": return self.error_json(404,"Not found")
-        if not hmac.compare_digest(self.headers.get("Authorization",""),"Bearer "+TOKEN): return self.error_json(401,"Unauthorized")
-        if self.headers.get("Content-Type","").split(";")[0]!="video/mp4": return self.error_json(415,"MP4 required")
+        ct=self.headers.get("Content-Type","")
+        if not ct.startswith("multipart/form-data;"): return self.upload_result(415,"Use the upload form")
         try: size=int(self.headers.get("Content-Length","0"))
-        except ValueError: return self.error_json(400,"Invalid length")
-        if not 0<size<=LIMIT: return self.error_json(413,"Maximum 100 MiB")
+        except ValueError: return self.upload_result(400,"Invalid length")
+        if not 0<size<=LIMIT+65536: return self.upload_result(413,"Maximum 100 MiB")
         asset=uuid.uuid4().hex; tmp=ROOT/(asset+".part"); dest=ROOT/(asset+".mp4")
         try:
-            with tmp.open("xb") as f:
-                left=size
-                while left:
-                    chunk=self.rfile.read(min(left,1024*1024))
-                    if not chunk: raise ValueError("Incomplete upload")
-                    f.write(chunk);left-=len(chunk)
+            body=self.rfile.read(size)
+            if len(body)!=size: raise ValueError("Incomplete upload")
+            message=BytesParser(policy=default).parsebytes(("Content-Type: "+ct+"\r\nMIME-Version: 1.0\r\n\r\n").encode()+body)
+            parts={p.get_param("name",header="content-disposition"):p.get_payload(decode=True) for p in message.iter_parts()}
+            if not hmac.compare_digest(parts.get("token") or b"",TOKEN.encode()): return self.upload_result(401,"رمز الدخول غير صحيح")
+            if parts.get("approved")!=b"yes": return self.upload_result(400,"اعتماد النسخة مطلوب")
+            video=parts.get("video") or b""
+            if not 0<len(video)<=LIMIT: return self.upload_result(413,"Maximum 100 MiB")
+            with tmp.open("xb") as file: file.write(video)
             meta=probe(tmp);tmp.replace(dest)
             expires=int(time.time())+TTL
-            self.reply(201,{"id":asset,"expires":expires,"metadata":meta,"url":f"{BASE}/media/{asset}/{expires}/{sign(asset,expires)}/video.mp4"})
-        except (ValueError,KeyError,StopIteration,subprocess.SubprocessError,OSError):
-            self.error_json(400,"Upload or video validation failed")
+            url=f"{BASE}/media/{asset}/{expires}/{sign(asset,expires)}/video.mp4"
+            self.upload_result(201,"تم رفع الفيديو وفحصه بنجاح",url,meta)
+        except (ValueError,KeyError,StopIteration,subprocess.SubprocessError,OSError) as exc:
+            self.upload_result(400,"فشل الرفع أو فحص الفيديو: "+type(exc).__name__)
         finally: tmp.unlink(missing_ok=True)
     def do_HEAD(self): self.do_GET()
     def do_GET(self):
